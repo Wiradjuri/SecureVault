@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { invoke, isTauri } from '@tauri-apps/api/core'
+import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { getCurrentWindow } from '@tauri-apps/api/window'
 import { open } from '@tauri-apps/plugin-dialog'
 import './App.css'
 
@@ -11,81 +10,36 @@ type EncryptionProgress = {
   fileName: string
 }
 
-type RestoreResult = {
-  restorePath: string
-  fileCount: number
-  lockedFolder: boolean
-}
-
-type LockResult = {
-  vaultPath: string
-  fileCount: number
-  lockedFolderPath: string
-}
-
-type UnlockedSession = {
-  folderPath: string
-  password: string
-  expiresAt: number
-}
-
-type DriveAudit = {
+type Vault = {
+  path: string
   name: string
-  type: string
-  capacity: string
-  available: string
-  filesystem: string
-  removable: boolean
-  mountPoint: string
+  fileCount: number
+  unlockedPath?: string
+  unlockedAt?: number
 }
 
-const navItems = [
-  'Dashboard',
-  'Folder Lock',
-  'Smart Format',
-  'Secure Volumes',
-  'Connected Drives',
-  'Settings',
-]
+const navItems = ['Dashboard', 'My Vaults', 'Create Vault', 'Settings']
 
 function App() {
   const [activeTab, setActiveTab] = useState('Dashboard')
-  const [drives, setDrives] = useState<DriveAudit[]>([])
-  const [isLoadingDrives, setIsLoadingDrives] = useState(false)
-  const [createdVaults, setCreatedVaults] = useState<string[]>([])
-  const [selectedFolder, setSelectedFolder] = useState('')
-  const [isSelectingFolder, setIsSelectingFolder] = useState(false)
-  const [selectedVault, setSelectedVault] = useState('')
-  const [restorePassword, setRestorePassword] = useState('')
-  const [restoreStatus, setRestoreStatus] = useState('')
-  const [isRestoring, setIsRestoring] = useState(false)
+  const [vaults, setVaults] = useState<Vault[]>([])
   const [password, setPassword] = useState('')
-  const [statusText, setStatusText] = useState('Choose a folder, then confirm to encrypt and remove its plaintext contents.')
+  const [vaultName, setVaultName] = useState('')
+  const [selectedLocation, setSelectedLocation] = useState('')
+  const [statusText, setStatusText] = useState('Welcome to SecureVault. Create a vault or add files to an existing vault.')
   const [isCreating, setIsCreating] = useState(false)
-  const [confirmRemoveOriginal, setConfirmRemoveOriginal] = useState(false)
-  const [isProgressListenerReady, setIsProgressListenerReady] = useState(false)
-  const [isRestoreListenerReady, setIsRestoreListenerReady] = useState(false)
-  const [isCloseLockReady, setIsCloseLockReady] = useState(false)
   const [encryptionProgress, setEncryptionProgress] = useState<EncryptionProgress | null>(null)
-  const [restoreProgress, setRestoreProgress] = useState<EncryptionProgress | null>(null)
-  const [unlockedSession, setUnlockedSession] = useState<UnlockedSession | null>(null)
-  const [idleSeconds, setIdleSeconds] = useState(600)
-  const [isFolderWritable, setIsFolderWritable] = useState(false)
-  const unlockedSessionRef = useRef<UnlockedSession | null>(null)
-  const lockOperationRef = useRef<Promise<LockResult> | null>(null)
-  const lockingSessionRef = useRef(false)
-  const isBusyRef = useRef(false)
-  const lockFailedRef = useRef(false)
+  const [isProgressListenerReady, setIsProgressListenerReady] = useState(false)
   const [appearance, setAppearance] = useState<'dark' | 'light'>(() =>
     localStorage.getItem('securevault-appearance') === 'light' ? 'light' : 'dark',
   )
   const [reduceMotion, setReduceMotion] = useState(() =>
     localStorage.getItem('securevault-reduce-motion') === 'true',
   )
+  const isBusyRef = useRef(false)
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
-    let unlistenRestore: (() => void) | undefined
     let cancelled = false
 
     void listen<EncryptionProgress>('vault-encryption-progress', (event) => {
@@ -100,23 +54,10 @@ function App() {
     }).catch((error: unknown) => {
       setStatusText(`Could not listen for encryption progress: ${String(error)}`)
     })
-    void listen<EncryptionProgress>('vault-restore-progress', (event) => {
-      setRestoreProgress(event.payload)
-    }).then((stopListening) => {
-      if (cancelled) {
-        stopListening()
-      } else {
-        unlistenRestore = stopListening
-        setIsRestoreListenerReady(true)
-      }
-    }).catch((error: unknown) => {
-      setRestoreStatus(`Could not listen for restore progress: ${String(error)}`)
-    })
 
     return () => {
       cancelled = true
       unlisten?.()
-      unlistenRestore?.()
     }
   }, [])
 
@@ -125,229 +66,38 @@ function App() {
     localStorage.setItem('securevault-reduce-motion', String(reduceMotion))
   }, [appearance, reduceMotion])
 
-  const refreshDriveInventory = async () => {
-    setIsLoadingDrives(true)
-    try {
-      const result = await invoke<DriveAudit[]>('get_drive_analysis')
-      setDrives(result)
-    } catch (error) {
-      setStatusText(`Drive inventory failed: ${String(error)}`)
-    } finally {
-      setIsLoadingDrives(false)
-    }
-  }
-
-  const [formatTarget, setFormatTarget] = useState('')
-  const [formatFs, setFormatFs] = useState('ExFAT')
-  const [formatName, setFormatName] = useState('SECUREVAULT')
-  const [formatConfirm, setFormatConfirm] = useState('')
-  const [formatStatus, setFormatStatus] = useState('')
-  const [isFormatting, setIsFormatting] = useState(false)
-
-  const handleFormat = async () => {
-    setIsFormatting(true)
-    setFormatStatus('Formatting…')
-    try {
-      await invoke<string>('format_volume', {
-        mountPoint: formatTarget,
-        filesystem: formatFs,
-        newName: formatName,
-        confirmation: formatConfirm,
-      })
-      setFormatStatus('Volume formatted.')
-      setFormatConfirm('')
-      setFormatTarget('')
-      await refreshDriveInventory()
-    } catch (error) {
-      setFormatStatus(`Format failed: ${String(error)}`)
-    } finally {
-      setIsFormatting(false)
-    }
-  }
-
-  const navigateTo = (tab: string) => {
-    setActiveTab(tab)
-    if (tab === 'Connected Drives' || tab === 'Smart Format') {
-      void refreshDriveInventory()
-    }
-  }
-
-  const updateUnlockedSession = (session: UnlockedSession | null) => {
-    unlockedSessionRef.current = session
-    setUnlockedSession(session)
-    if (!session) {
-      setIdleSeconds(600)
-      setIsFolderWritable(false)
-    }
-    lockFailedRef.current = false
-  }
-
-  const handleToggleFolderAccess = async () => {
-    if (!unlockedSession) return
-
-    try {
-      if (isFolderWritable) {
-        await invoke<void>('lock_unlocked_folder', {
-          folderPath: unlockedSession.folderPath,
-        })
-        setIsFolderWritable(false)
-        setStatusText('Folder is now read-only for protection.')
-      } else {
-        await invoke<void>('unlock_folder_for_modification', {
-          folderPath: unlockedSession.folderPath,
-        })
-        setIsFolderWritable(true)
-        setStatusText('Folder is now writable. Remember to lock it when done.')
-      }
-    } catch (error) {
-      setStatusText(`Could not change folder access: ${String(error)}`)
-    }
-  }
-
-  const lockOpenedFolder = (session: UnlockedSession): Promise<LockResult> => {
-    if (lockOperationRef.current) return lockOperationRef.current
-
-    lockingSessionRef.current = true
-    isBusyRef.current = true
-    setIsCreating(true)
-    setEncryptionProgress({ current: 0, total: 0, fileName: '' })
-    setStatusText('Verifying and locking the unlocked folder…')
-    const operation = invoke<void>('lock_unlocked_folder', {
-      folderPath: session.folderPath,
-    }).then(() => invoke<LockResult>('lock_folder', {
-      request: {
-        sourcePath: session.folderPath,
-        password: session.password,
-        confirmRemoveOriginal: true,
-      },
-    })).then((result) => {
-      updateUnlockedSession(null)
-      setSelectedFolder('')
-      setSelectedVault(result.vaultPath)
-      setCreatedVaults((previous) =>
-        previous.includes(result.vaultPath) ? previous : [...previous, result.vaultPath],
-      )
-      setPassword('')
-      setStatusText(`Folder locked and verified. Encrypted data is at ${result.vaultPath}.`)
-      return result
-    }).catch((error: unknown) => {
-      lockFailedRef.current = true
-      setStatusText(`Folder lock failed: ${String(error)}`)
-      throw error
-    }).finally(() => {
-      lockOperationRef.current = null
-      lockingSessionRef.current = false
-      isBusyRef.current = false
-      setIsCreating(false)
-    })
-    lockOperationRef.current = operation
-    return operation
-  }
-
-  useEffect(() => {
-    if (!unlockedSession) {
-      return
-    }
-
-    const updateCountdown = () => {
-      const remaining = Math.max(0, Math.ceil((unlockedSession.expiresAt - Date.now()) / 1000))
-      setIdleSeconds(remaining)
-      if (remaining === 0 && !lockingSessionRef.current && !lockFailedRef.current) {
-        void lockOpenedFolder(unlockedSession).catch(() => undefined)
-      }
-    }
-    updateCountdown()
-    const interval = window.setInterval(updateCountdown, 1000)
-    return () => window.clearInterval(interval)
-  }, [unlockedSession])
-
-  useEffect(() => {
-    if (!isTauri()) return
-    const appWindow = getCurrentWindow()
-    let unlisten: (() => void) | undefined
-    let cancelled = false
-    void appWindow.onCloseRequested(async (event) => {
-      if (isBusyRef.current) {
-        event.preventDefault()
-        setStatusText('Wait for the current encryption or unlock operation to finish before closing.')
-        return
-      }
-      const session = unlockedSessionRef.current
-      if (!session) return
-      event.preventDefault()
-      try {
-        await lockOpenedFolder(session)
-        await appWindow.close()
-      } catch {
-        // Keep the app open so the user can address a failed lock operation.
-      }
-    }).then((stopListening) => {
-      if (cancelled) stopListening()
-      else {
-        unlisten = stopListening
-        setIsCloseLockReady(true)
-      }
-    }).catch((error: unknown) => {
-      setIsCloseLockReady(false)
-      const message = `Could not enable close-time folder locking: ${String(error)}`
-      setStatusText(message)
-      setRestoreStatus(message)
-    })
-    return () => {
-      cancelled = true
-      unlisten?.()
-    }
-  }, [])
-
-  const handleSelectFolder = async () => {
-    setIsSelectingFolder(true)
+  const handleSelectLocation = async () => {
     try {
       const folder = await open({
         directory: true,
         multiple: false,
-        title: 'Select folder to lock',
+        title: 'Select location for new vault',
       })
 
       if (typeof folder === 'string') {
-        setSelectedFolder(folder)
-        setConfirmRemoveOriginal(false)
-        setStatusText(`Folder selected: ${folder}`)
+        setSelectedLocation(folder)
+        setStatusText(`Location selected: ${folder}`)
       } else {
-        setStatusText('Folder selection cancelled.')
+        setStatusText('Location selection cancelled.')
       }
     } catch (error) {
       setStatusText(`Folder picker error: ${error instanceof Error ? error.message : String(error)}`)
-    } finally {
-      setIsSelectingFolder(false)
     }
   }
 
-  const handleSelectVault = async () => {
-    try {
-      const path = await open({
-        directory: true,
-        multiple: false,
-        title: 'Select a .securevault folder to restore',
-      })
-      if (typeof path === 'string') {
-        setSelectedVault(path)
-        setRestoreStatus('Vault selected. Enter its password to unlock it beside the vault.')
-      } else {
-        setRestoreStatus('Vault selection cancelled.')
-      }
-    } catch (error) {
-      setRestoreStatus(`Vault picker error: ${error instanceof Error ? error.message : String(error)}`)
-    }
-  }
-
-  const handleLockFolder = async () => {
+  const handleCreateVault = async () => {
     if (!isProgressListenerReady) {
       setStatusText('Encryption progress is not ready yet. Please try again in a moment.')
       return
     }
 
-    if (!selectedFolder) {
-      setStatusText('Select a folder before locking it.')
+    if (!vaultName.trim()) {
+      setStatusText('Enter a vault name.')
+      return
+    }
+
+    if (!selectedLocation) {
+      setStatusText('Select a location for the vault.')
       return
     }
 
@@ -356,88 +106,120 @@ function App() {
       return
     }
 
-    if (!confirmRemoveOriginal) {
-      setStatusText('Confirm that the plaintext folder should be removed after verification.')
-      return
-    }
-
     setIsCreating(true)
     isBusyRef.current = true
-    setEncryptionProgress({ current: 0, total: 0, fileName: '' })
-    setStatusText('Encrypting and verifying the selected folder…')
 
     try {
-      const result = await invoke<LockResult>('lock_folder', {
-        request: {
-          sourcePath: selectedFolder,
-          password,
-          confirmRemoveOriginal: true,
-        },
+      const result = await invoke<{ vaultPath: string }>('create_vault', {
+        location: selectedLocation,
+        vaultName,
+        password,
       })
 
-      setStatusText(`Folder locked. ${result.fileCount} file(s) are encrypted at ${result.vaultPath}.`)
-      setCreatedVaults((previous) => [...previous, result.vaultPath])
-      setSelectedVault(result.vaultPath)
-      setSelectedFolder('')
+      const vaultPath = result.vaultPath
+      const name = vaultName.trim()
+      setVaults((prev) => [...prev, { path: vaultPath, name, fileCount: 0 }])
+      setStatusText(`Vault created: ${name}`)
+      setVaultName('')
       setPassword('')
-      setConfirmRemoveOriginal(false)
+      setSelectedLocation('')
     } catch (error) {
-      setEncryptionProgress(null)
-      setStatusText(`Folder lock failed: ${String(error)}`)
+      setStatusText(`Vault creation failed: ${String(error)}`)
     } finally {
       isBusyRef.current = false
       setIsCreating(false)
     }
   }
 
-  const handleRestoreVault = async () => {
-    if (!isCloseLockReady) {
-      setRestoreStatus('Close-time locking is not ready. SecureVault will not unlock a folder until this safeguard is available.')
-      return
-    }
-
-    if (!isRestoreListenerReady) {
-      setRestoreStatus('Restore progress is not ready yet. Please try again in a moment.')
-      return
-    }
-
-    if (!selectedVault || !restorePassword) {
-      setRestoreStatus('Choose a vault and enter its password.')
-      return
-    }
-
-    setIsRestoring(true)
-    isBusyRef.current = true
-    setRestoreProgress({ current: 0, total: 0, fileName: '' })
-    setRestoreStatus('Verifying and restoring encrypted files…')
+  const handleAddFilesToVault = async (vault: Vault) => {
     try {
-      const result = await invoke<RestoreResult>('restore_encrypted_vault', {
-        request: {
-          vaultPath: selectedVault,
-          destinationPath: '',
-          password: restorePassword,
-        },
+      const files = await open({
+        multiple: true,
+        title: 'Select files to add to vault',
       })
-      if (result.lockedFolder) {
-        updateUnlockedSession({
-          folderPath: result.restorePath,
-          password: restorePassword,
-          expiresAt: Date.now() + 10 * 60 * 1000,
+
+      if (Array.isArray(files) && files.length > 0) {
+        setIsCreating(true)
+        isBusyRef.current = true
+        setEncryptionProgress({ current: 0, total: files.length, fileName: '' })
+        setStatusText('Adding files to vault...')
+
+        const result = await invoke<{ filesAdded: number; totalFiles: number }>('add_files_to_vault', {
+          vaultPath: vault.path,
+          filePaths: files,
+          password,
         })
-        lockFailedRef.current = false
-        setIdleSeconds(600)
-        setSelectedVault('')
-        setRestoreStatus(`Folder unlocked at ${result.restorePath}. It will auto-lock 10 minutes after unlocking.`)
-      } else {
-        setRestoreStatus(`Legacy vault copied to ${result.restorePath}; it will not auto-lock.`)
+
+        setVaults((prev) =>
+          prev.map((v) =>
+            v.path === vault.path ? { ...v, fileCount: result.totalFiles } : v,
+          ),
+        )
+        setStatusText(`Added ${result.filesAdded} file(s). Vault now contains ${result.totalFiles} file(s).`)
+        setPassword('')
       }
-      setRestorePassword('')
     } catch (error) {
-      setRestoreProgress(null)
-      setRestoreStatus(`Restore failed: ${String(error)}`)
+      setStatusText(`Could not add files: ${String(error)}`)
     } finally {
       isBusyRef.current = false
-      setIsRestoring(false)
+      setIsCreating(false)
+      setEncryptionProgress(null)
+    }
+  }
+
+  const handleUnlockVault = async (vault: Vault) => {
+    if (!password.trim()) {
+      setStatusText('Enter the vault password.')
+      return
+    }
+
+    try {
+      const result = await invoke<{ unlockPath: string; fileCount: number }>('unlock_vault_container', {
+        vaultPath: vault.path,
+        password,
+      })
+
+      setVaults((prev) =>
+        prev.map((v) =>
+          v.path === vault.path ? { ...v, unlockedPath: result.unlockPath, unlockedAt: Date.now() } : v,
+        ),
+      )
+      setStatusText(`Vault unlocked at ${result.unlockPath}. Folder is read-only for protection.`)
+      setPassword('')
+    } catch (error) {
+      setStatusText(`Could not unlock vault: ${String(error)}`)
+    }
+  }
+
+  const handleLockVault = async (vault: Vault) => {
+    if (!vault.unlockedPath) return
+
+    try {
+      await invoke<void>('lock_unlocked_folder', {
+        folderPath: vault.unlockedPath,
+      })
+
+      setVaults((prev) =>
+        prev.map((v) =>
+          v.path === vault.path ? { ...v, unlockedPath: undefined, unlockedAt: undefined } : v,
+        ),
+      )
+      setStatusText('Vault locked and folder made read-only.')
+    } catch (error) {
+      setStatusText(`Could not lock vault: ${String(error)}`)
+    }
+  }
+
+  const handleEnableAccess = async (vault: Vault) => {
+    if (!vault.unlockedPath) return
+
+    try {
+      await invoke<void>('unlock_folder_for_modification', {
+        folderPath: vault.unlockedPath,
+      })
+      setStatusText('Folder is now writable. Remember to lock it when done.')
+    } catch (error) {
+      setStatusText(`Could not enable access: ${String(error)}`)
     }
   }
 
@@ -459,7 +241,7 @@ function App() {
               type="button"
               className={item === activeTab ? 'nav-item active' : 'nav-item'}
               aria-current={item === activeTab ? 'page' : undefined}
-              onClick={() => navigateTo(item)}
+              onClick={() => setActiveTab(item)}
             >
               {item}
             </button>
@@ -469,7 +251,7 @@ function App() {
         <div className="status-panel">
           <p className="panel-label">Vault protection</p>
           <div className="security-state">AES-256-GCM</div>
-          <p className="panel-copy">Locking encrypts, verifies, then removes the selected plaintext folder. Biometrics are not enabled.</p>
+          <p className="panel-copy">Vaults are encrypted containers. Files are encrypted and stored securely.</p>
         </div>
       </aside>
 
@@ -481,69 +263,25 @@ function App() {
           </div>
           <div className="toolbar">
             {activeTab === 'Dashboard' && (
-              <>
-                <button type="button" className="ghost-button" onClick={() => navigateTo('Connected Drives')}>
-                  Connected drives
-                </button>
-                <button type="button" className="primary-button" onClick={() => navigateTo('Folder Lock')}>
-                  Lock a folder
-                </button>
-              </>
-            )}
-            {activeTab === 'Smart Format' && (
-              <button type="button" className="ghost-button" onClick={() => navigateTo('Connected Drives')}>
-                View connected drives
+              <button type="button" className="primary-button" onClick={() => setActiveTab('Create Vault')}>
+                Create a vault
               </button>
             )}
-            {activeTab === 'Secure Volumes' && (
-              <button type="button" className="primary-button" onClick={() => navigateTo('Folder Lock')}>
-                Lock a folder
+            {activeTab === 'My Vaults' && (
+              <button type="button" className="primary-button" onClick={() => setActiveTab('Create Vault')}>
+                New vault
               </button>
             )}
           </div>
         </header>
 
-        {unlockedSession && (
-          <div className="session-banner" role="status">
-            <div>
-              <strong>Folder unlocked</strong>
-              <span>{unlockedSession.folderPath}</span>
-              <small>
-                Auto-lock in {Math.floor(idleSeconds / 60)}:{String(idleSeconds % 60).padStart(2, '0')}.
-                Folder is read-only for protection. {isFolderWritable && 'You temporarily enabled write access.'}
-              </small>
-              {statusText.startsWith('Folder lock failed:') && (
-                <small className="session-error" role="alert">{statusText}</small>
-              )}
-            </div>
-            <div style={{ display: 'flex', gap: '0.5rem' }}>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={handleToggleFolderAccess}
-                disabled={isCreating}
-              >
-                {isFolderWritable ? 'Make read-only' : 'Enable access'}
-              </button>
-              <button
-                type="button"
-                className="primary-button"
-                onClick={() => { void lockOpenedFolder(unlockedSession).catch(() => undefined) }}
-                disabled={isCreating}
-              >
-                {isCreating ? 'Locking…' : 'Lock now'}
-              </button>
-            </div>
-          </div>
-        )}
-
         {activeTab === 'Dashboard' && (
           <>
             <section className="metrics-grid" aria-label="Application status">
               <article className="metric-card">
-                <p>Vaults created this session</p>
-                <strong>{createdVaults.length}</strong>
-                <span>Encrypted folders</span>
+                <p>Vaults created</p>
+                <strong>{vaults.length}</strong>
+                <span>Encrypted containers</span>
               </article>
               <article className="metric-card">
                 <p>Encryption</p>
@@ -551,9 +289,9 @@ function App() {
                 <span>Password-derived Argon2id key</span>
               </article>
               <article className="metric-card">
-                <p>Drive operations</p>
-                <strong>Read-only</strong>
-                <span>Mounted volume inventory only</span>
+                <p>Storage model</p>
+                <strong>Container</strong>
+                <span>Add files to vaults anytime</span>
               </article>
             </section>
 
@@ -562,64 +300,57 @@ function App() {
                 <div className="panel-header">
                   <div>
                     <p className="eyebrow">Get started</p>
-                    <h3>Choose an action</h3>
+                    <h3>Create your first vault</h3>
                   </div>
                 </div>
                 <div className="quick-actions">
-                  <button type="button" className="quick-action" onClick={() => navigateTo('Folder Lock')}>
-                    <strong>Lock a folder</strong>
-                    <span>Encrypt, verify, then remove the plaintext folder.</span>
+                  <button type="button" className="quick-action" onClick={() => setActiveTab('Create Vault')}>
+                    <strong>Create a vault</strong>
+                    <span>Set up an encrypted container for your files.</span>
                   </button>
-                  <button type="button" className="quick-action" onClick={() => navigateTo('Secure Volumes')}>
-                    <strong>Unlock a folder</strong>
-                    <span>Open a .securevault with its password.</span>
-                  </button>
-                  <button type="button" className="quick-action" onClick={() => navigateTo('Smart Format')}>
-                    <strong>Smart Format</strong>
-                    <span>Review current disk-management support and safety.</span>
+                  <button type="button" className="quick-action" onClick={() => setActiveTab('My Vaults')}>
+                    <strong>View vaults</strong>
+                    <span>Access and manage your existing vaults.</span>
                   </button>
                 </div>
-              </article>
-              <article className="panel">
-                <div className="panel-header">
-                  <div>
-                    <p className="eyebrow">Platform support</p>
-                    <h3>Protection status</h3>
-                  </div>
-                </div>
-                <ul className="risk-list">
-                  <li><span>Biometric unlock</span><strong>Not implemented</strong></li>
-                  <li><span>Recovery keys</span><strong>Not available</strong></li>
-                  <li><span>Mounted volume inventory</span><strong>Available</strong></li>
-                  <li><span>Disk modification</span><strong>Removable volumes only</strong></li>
-                </ul>
               </article>
             </section>
           </>
         )}
 
-        {activeTab === 'Folder Lock' && (
+        {activeTab === 'Create Vault' && (
           <section className="action-panel panel">
             <div className="panel-header">
               <div>
-                <p className="eyebrow">Folder Lock</p>
-                <h3>Lock a folder</h3>
-                <p className="section-description">SecureVault encrypts and verifies the folder, then removes the plaintext source. The encrypted .securevault is created beside it.</p>
+                <p className="eyebrow">Create Vault</p>
+                <h3>New encrypted container</h3>
+                <p className="section-description">Vaults are encrypted containers where you can store files. Create one and then drag files into it.</p>
               </div>
             </div>
 
             <div className="action-form">
               <label>
-                Folder to lock
+                Vault name
+                <input
+                  type="text"
+                  value={vaultName}
+                  onChange={(event) => setVaultName(event.target.value)}
+                  placeholder="e.g., Personal Documents"
+                  disabled={isCreating}
+                />
+              </label>
+
+              <label>
+                Location
                 <div className="input-row">
                   <input
                     type="text"
                     readOnly
-                    value={selectedFolder}
-                    placeholder="Select a folder to lock"
+                    value={selectedLocation}
+                    placeholder="Select where to create the vault"
                   />
-                  <button type="button" className="secondary-button compact" onClick={handleSelectFolder} disabled={isCreating || isSelectingFolder}>
-                    {isSelectingFolder ? 'Opening…' : 'Browse'}
+                  <button type="button" className="secondary-button compact" onClick={handleSelectLocation} disabled={isCreating}>
+                    Browse
                   </button>
                 </div>
               </label>
@@ -635,24 +366,14 @@ function App() {
                 />
               </label>
 
-              <label className="confirmation-row">
-                <input
-                  type="checkbox"
-                  checked={confirmRemoveOriginal}
-                  onChange={(event) => setConfirmRemoveOriginal(event.target.checked)}
-                  disabled={isCreating}
-                />
-                <span>I understand the plaintext folder will be removed after verification; removal is not a secure wipe of disk blocks, snapshots, or backups.</span>
-              </label>
-
-              <button type="button" className="primary-button full-width" onClick={handleLockFolder} disabled={isCreating || !isProgressListenerReady || !confirmRemoveOriginal}>
-                {isCreating ? 'Locking…' : isProgressListenerReady ? 'Lock selected folder' : 'Preparing…'}
+              <button type="button" className="primary-button full-width" onClick={handleCreateVault} disabled={isCreating}>
+                {isCreating ? 'Creating…' : 'Create vault'}
               </button>
 
               {(isCreating || encryptionProgress !== null) && (
                 <div className="encryption-progress" aria-live="polite">
                   <div className="progress-heading">
-                    <span>{isCreating ? 'Encrypting and verifying' : 'Folder locked'}</span>
+                    <span>{isCreating ? 'Adding files' : 'Complete'}</span>
                     {encryptionProgress && encryptionProgress.total > 0 && (
                       <span>{encryptionProgress.current} / {encryptionProgress.total}</span>
                     )}
@@ -660,7 +381,7 @@ function App() {
                   <div
                     className="progress-track"
                     role="progressbar"
-                    aria-label="Folder encryption progress"
+                    aria-label="Encryption progress"
                     aria-valuemin={0}
                     aria-valuemax={encryptionProgress?.total || 100}
                     aria-valuenow={
@@ -678,11 +399,6 @@ function App() {
                       }}
                     />
                   </div>
-                  <span className="progress-file">
-                    {encryptionProgress?.fileName
-                      ? `Encrypted: ${encryptionProgress.fileName}`
-                      : isCreating ? 'Preparing secure vault…' : 'Vault verified; plaintext removed'}
-                  </span>
                 </div>
               )}
 
@@ -691,184 +407,93 @@ function App() {
           </section>
         )}
 
-        {activeTab === 'Smart Format' && (
+        {activeTab === 'My Vaults' && (
           <section className="panel page-panel">
-            <p className="eyebrow">Safe storage guidance</p>
-            <h3>Mounted storage analysis</h3>
-            <button type="button" className="secondary-button compact" onClick={refreshDriveInventory} disabled={isLoadingDrives}>
-              {isLoadingDrives ? 'Scanning…' : 'Refresh inventory'}
-            </button>
+            <p className="eyebrow">Your vaults</p>
+            <h3>Encrypted containers</h3>
             <p className="section-description">
-              SecureVault inspects mounted volumes on this device. Partitioning, resizing and conversion are disabled; only removable volumes can be erased and formatted, after typed confirmation; this inventory does not inspect unmounted partitions or establish backup safety.
+              Click a vault to add files to it. Unlock to view contents temporarily.
             </p>
-            <div className="drive-grid">
-              {drives.map((drive) => (
-                <article key={`${drive.name}:${drive.type}`} className="drive-card">
-                  <div className="drive-topline">
-                    <span className="drive-name">{drive.name}</span>
-                    <span className="risk-badge low">{drive.removable ? 'Removable' : 'Mounted'}</span>
-                  </div>
-                  <p>{drive.type}</p>
-                  <ul>
-                    <li><span>Capacity</span><strong>{drive.capacity}</strong></li>
-                    <li><span>Available</span><strong>{drive.available}</strong></li>
-                    <li><span>Filesystem</span><strong>{drive.filesystem}</strong></li>
-                  </ul>
-                </article>
-              ))}
-            </div>
-            <div className="support-grid">
-              <article>
-                <strong>Format removable volume</strong>
-                <select value={formatTarget} onChange={(e) => setFormatTarget(e.target.value)}>
-                  <option value="">Select a removable volume</option>
-                  {drives.filter((d) => d.removable).map((d) => (
-                    <option key={d.mountPoint} value={d.mountPoint}>{d.name} ({d.mountPoint})</option>
-                  ))}
-                </select>
-                <select value={formatFs} onChange={(e) => setFormatFs(e.target.value)}>
-                  <option value="ExFAT">ExFAT</option>
-                  <option value="APFS">APFS</option>
-                  <option value="JHFS+">Mac OS Extended</option>
-                  <option value="MS-DOS FAT32">FAT32</option>
-                </select>
-                <input value={formatName} maxLength={11} onChange={(e) => setFormatName(e.target.value)} aria-label="New volume name" />
-                <input
-                  value={formatConfirm}
-                  onChange={(e) => setFormatConfirm(e.target.value)}
-                  placeholder={formatTarget ? 'Type ERASE ' + formatTarget.split('/').pop() : 'Select a volume first'}
-                  aria-label="Erase confirmation"
-                />
-                <button type="button" className="primary-button" onClick={handleFormat} disabled={isFormatting || !formatTarget || !formatConfirm}>
-                  {isFormatting ? 'Formatting…' : 'Erase and format'}
-                </button>
-                <span role="status">{formatStatus}</span>
-              </article>
-            </div>
-            <p className="status-text" role="status">
-              {isLoadingDrives ? 'Scanning mounted volumes…' : `${drives.length} mounted volume(s) found.`}
-            </p>
-            <div className="support-grid">
-              <article><strong>New volume</strong><span>Requires live partition and filesystem analysis.</span></article>
-              <article><strong>New partition</strong><span>Requires privileged disk tools and explicit confirmation.</span></article>
-              <article><strong>Resize or convert</strong><span>Filesystem-specific support and verified backups are required.</span></article>
-              <article><strong>Reformat</strong><span>Destructive; removable volumes only (macOS).</span></article>
-            </div>
-            <button type="button" className="primary-button" onClick={() => navigateTo('Folder Lock')}>
-              Create a file-based encrypted vault instead
-            </button>
-          </section>
-        )}
 
-        {activeTab === 'Secure Volumes' && (
-          <section className="panel page-panel">
-            <p className="eyebrow">Encrypted file vaults</p>
-            <h3>Secure volumes</h3>
-            <p className="section-description">
-              Locked folders are stored as encrypted .securevault archives beside their original location. Unlocking restores the folder there and removes the archive after verification.
-            </p>
-            {createdVaults.length === 0 ? (
+            {vaults.length === 0 ? (
               <div className="empty-state">
-                <strong>No vaults created in this session</strong>
-                <span>Lock a folder or select an existing .securevault archive to unlock it.</span>
-                <button type="button" className="primary-button" onClick={() => navigateTo('Folder Lock')}>
-                  Go to Folder Lock
+                <strong>No vaults yet</strong>
+                <span>Create a vault to get started storing encrypted files.</span>
+                <button type="button" className="primary-button" onClick={() => setActiveTab('Create Vault')}>
+                  Create your first vault
                 </button>
               </div>
             ) : (
-              <ul className="created-vault-list">
-                {createdVaults.map((vaultPath) => (
-                  <li key={vaultPath}>
-                    <span>{vaultPath}</span>
-                    <strong>Encrypted copy</strong>
-                  </li>
-                ))}
-              </ul>
-            )}
-            <div className="restore-form">
-              <h4>Unlock a folder</h4>
-              <div className="input-row">
-                <input aria-label="Vault folder" readOnly value={selectedVault} placeholder="Select a .securevault folder" />
-                <button type="button" className="secondary-button compact" onClick={handleSelectVault} disabled={isRestoring || isCreating}>Choose vault</button>
-              </div>
-              <input
-                aria-label="Vault password for restore"
-                type="password"
-                value={restorePassword}
-                onChange={(event) => setRestorePassword(event.target.value)}
-                placeholder="Vault password"
-                disabled={isRestoring}
-              />
-              <button type="button" className="primary-button" onClick={handleRestoreVault} disabled={isRestoring || !isRestoreListenerReady || !isCloseLockReady || Boolean(unlockedSession)}>
-                {isRestoring ? 'Verifying and unlocking…' : !isCloseLockReady ? 'Preparing close protection…' : isRestoreListenerReady ? 'Unlock folder' : 'Preparing…'}
-              </button>
-              {(isRestoring || restoreProgress !== null) && (
-                <div className="encryption-progress" aria-live="polite">
-                  <div className="progress-heading">
-                    <span>{isRestoring ? 'Restoring files' : 'Restore complete'}</span>
-                    {restoreProgress && restoreProgress.total > 0 && (
-                      <span>{restoreProgress.current} / {restoreProgress.total}</span>
-                    )}
-                  </div>
-                  <div
-                    className="progress-track"
-                    role="progressbar"
-                    aria-label="Vault restore progress"
-                    aria-valuemin={0}
-                    aria-valuemax={restoreProgress?.total || 100}
-                    aria-valuenow={restoreProgress?.current || 0}
-                  >
-                    <div
-                      className="progress-fill"
-                      style={{
-                        width: `${restoreProgress && restoreProgress.total > 0
-                          ? (restoreProgress.current / restoreProgress.total) * 100
-                          : 0}%`,
-                      }}
-                    />
-                  </div>
-                  <span className="progress-file">
-                    {restoreProgress?.fileName || (isRestoring ? 'Checking vault integrity…' : 'All files restored')}
-                  </span>
-                </div>
-              )}
-              <p className="status-text" role="status">{restoreStatus}</p>
-            </div>
-          </section>
-        )}
-
-        {activeTab === 'Connected Drives' && (
-          <section className="panel page-panel">
-            <div className="panel-header">
-              <div>
-                <p className="eyebrow">Drive overview</p>
-                <h3>Connected drives</h3>
-              </div>
-              <button type="button" className="secondary-button compact" onClick={() => navigateTo('Smart Format')}>
-                Smart Format support
-              </button>
-              <button type="button" className="secondary-button compact" onClick={refreshDriveInventory} disabled={isLoadingDrives}>
-                {isLoadingDrives ? 'Scanning…' : 'Refresh'}
-              </button>
-            </div>
-            <div className="empty-state">
-              <strong>{isLoadingDrives ? 'Scanning mounted volumes…' : `Found ${drives.length} mounted volume(s)`}</strong>
-              <span>Inventory shows mounted filesystems only; it does not identify every physical drive or unmounted partition.</span>
-            </div>
-            {drives.length > 0 && (
-              <div className="drive-grid">
-                {drives.map((drive) => (
-                  <article key={`${drive.name}:${drive.type}`} className="drive-card">
-                    <div className="drive-topline">
-                      <span className="drive-name">{drive.name}</span>
-                      <span className="risk-badge low">{drive.removable ? 'Removable' : 'Mounted'}</span>
+              <div style={{ display: 'grid', gap: '1rem' }}>
+                {vaults.map((vault) => (
+                  <article key={vault.path} className="panel" style={{ padding: '1.5rem', borderLeft: '4px solid var(--color-accent)' }}>
+                    <div style={{ marginBottom: '1rem' }}>
+                      <strong>{vault.name}</strong>
+                      <small style={{ display: 'block', marginTop: '0.25rem', opacity: 0.7 }}>{vault.fileCount} file(s)</small>
+                      <small style={{ display: 'block', opacity: 0.6, fontSize: '0.8em', marginTop: '0.5rem', wordBreak: 'break-all' }}>
+                        {vault.path}
+                      </small>
                     </div>
-                    <p>{drive.type}</p>
-                    <ul>
-                      <li><span>Capacity</span><strong>{drive.capacity}</strong></li>
-                      <li><span>Available</span><strong>{drive.available}</strong></li>
-                      <li><span>Filesystem</span><strong>{drive.filesystem}</strong></li>
-                    </ul>
+
+                    {vault.unlockedPath ? (
+                      <div style={{ marginBottom: '1rem', padding: '0.75rem', backgroundColor: 'var(--color-surface-alt)', borderRadius: '0.5rem' }}>
+                        <small style={{ display: 'block' }}>
+                          <strong>Unlocked at:</strong> {vault.unlockedPath}
+                        </small>
+                      </div>
+                    ) : null}
+
+                    <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                      {!vault.unlockedPath ? (
+                        <>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: 0 }}>
+                            <input
+                              type="password"
+                              value={password}
+                              onChange={(event) => setPassword(event.target.value)}
+                              placeholder="Password"
+                              disabled={isCreating}
+                              style={{ width: '150px' }}
+                            />
+                          </label>
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => handleAddFilesToVault(vault)}
+                            disabled={isCreating || !password.trim()}
+                          >
+                            Add files
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => handleUnlockVault(vault)}
+                            disabled={isCreating || !password.trim()}
+                          >
+                            Unlock
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => handleEnableAccess(vault)}
+                            disabled={isCreating}
+                          >
+                            Enable access
+                          </button>
+                          <button
+                            type="button"
+                            className="primary-button"
+                            onClick={() => handleLockVault(vault)}
+                            disabled={isCreating}
+                          >
+                            Lock vault
+                          </button>
+                        </>
+                      )}
+                    </div>
                   </article>
                 ))}
               </div>
@@ -893,12 +518,8 @@ function App() {
                 <input type="checkbox" checked={reduceMotion} onChange={(event) => setReduceMotion(event.target.checked)} />
               </label>
               <div className="setting-row">
-                <span><strong>Automatic locking</strong><small>Re-encrypts the unlocked folder 10 minutes after it is unlocked.</small></span>
-                <span className="pill neutral">10 minutes</span>
-              </div>
-              <div className="setting-row">
-                <span><strong>Biometric unlock</strong><small>Platform key-store integration is not implemented; biometrics cannot securely unlock vault keys yet.</small></span>
-                <span className="pill neutral">Not implemented</span>
+                <span><strong>Encryption</strong><small>All vaults use AES-256-GCM with Argon2id key derivation.</small></span>
+                <span className="pill neutral">Military-grade</span>
               </div>
             </div>
           </section>

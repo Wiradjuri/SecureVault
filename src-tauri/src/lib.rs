@@ -46,6 +46,50 @@ pub struct RestoreVaultResponse {
     pub locked_folder: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateVaultRequest {
+    pub location: String,
+    pub vault_name: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateVaultResponse {
+    pub vault_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddFilesToVaultRequest {
+    pub vault_path: String,
+    pub file_paths: Vec<String>,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddFilesToVaultResponse {
+    pub vault_path: String,
+    pub files_added: usize,
+    pub total_files: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlockVaultRequest {
+    pub vault_path: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlockVaultResponse {
+    pub unlock_path: String,
+    pub file_count: usize,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DriveAudit {
@@ -243,6 +287,216 @@ fn get_drive_analysis() -> Vec<DriveAudit> {
         .collect()
 }
 
+#[tauri::command]
+fn create_vault(request: CreateVaultRequest) -> Result<CreateVaultResponse, String> {
+    if request.vault_name.is_empty() {
+        return Err("Vault name cannot be empty.".to_string());
+    }
+    if request.password.is_empty() {
+        return Err("Vault password is required.".to_string());
+    }
+
+    let location = PathBuf::from(&request.location);
+    if !location.exists() || !location.is_dir() {
+        return Err("Location must be an existing directory.".to_string());
+    }
+
+    let vault_name = format!("{}.securevault", request.vault_name);
+    let vault_path = location.join(&vault_name);
+
+    if vault_path.exists() {
+        return Err(format!("A vault already exists at {}", vault_path.display()));
+    }
+
+    let mut rng = rand::thread_rng();
+    let salt = SaltString::generate(&mut rng);
+
+    fs::create_dir(&vault_path)
+        .map_err(|error| format!("Could not create vault folder: {error}"))?;
+
+    let metadata = VaultMetadata {
+        version: 3,
+        created_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("Could not read current time: {error}"))?
+            .as_secs(),
+        salt: salt.to_string(),
+        directories: Vec::new(),
+        files: Vec::new(),
+    };
+
+    let metadata_path = vault_path.join("vault.meta.json");
+    fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&metadata)
+            .map_err(|error| format!("Could not serialize metadata: {error}"))?,
+    )
+    .map_err(|error| format!("Could not write metadata file: {error}"))?;
+
+    Ok(CreateVaultResponse {
+        vault_path: vault_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+fn add_files_to_vault(
+    app: tauri::AppHandle,
+    request: AddFilesToVaultRequest,
+) -> Result<AddFilesToVaultResponse, String> {
+    if request.password.is_empty() {
+        return Err("Vault password is required.".to_string());
+    }
+    if request.file_paths.is_empty() {
+        return Err("No files selected to add to vault.".to_string());
+    }
+
+    let vault_path = PathBuf::from(&request.vault_path);
+    if !vault_path.is_dir() {
+        return Err("Vault does not exist or is not accessible.".to_string());
+    }
+
+    let metadata_path = vault_path.join("vault.meta.json");
+    let metadata_bytes = fs::read(&metadata_path)
+        .map_err(|error| format!("Could not read vault metadata: {error}"))?;
+    let mut metadata: VaultMetadata = serde_json::from_slice(&metadata_bytes)
+        .map_err(|error| format!("Vault metadata is invalid: {error}"))?;
+
+    let key_bytes = derive_key(&request.password, metadata.salt.as_bytes())?;
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|error| format!("Invalid AES key: {error}"))?;
+
+    let mut rng = rand::thread_rng();
+    let mut files_added = 0;
+    let total_files = request.file_paths.len();
+
+    for file_path_str in &request.file_paths {
+        let file_path = PathBuf::from(file_path_str);
+        if !file_path.exists() {
+            continue;
+        }
+
+        if file_path.is_file() {
+            let file_bytes = fs::read(&file_path)
+                .map_err(|error| format!("Could not read {:?}: {error}", file_path))?;
+            let nonce_bytes: [u8; 12] = rng.r#gen();
+            let nonce = Nonce::from(nonce_bytes);
+            let ciphertext = cipher
+                .encrypt(&nonce, file_bytes.as_ref())
+                .map_err(|error| format!("Encryption failed for {:?}: {error}", file_path))?;
+
+            let file_name = file_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unnamed".to_string());
+            let encrypted_path = encrypt_relative_path(&cipher, &mut rng, Path::new(&file_name))?;
+
+            metadata.files.push(EncryptedFileEntry {
+                relative_path: None,
+                path_nonce: Some(encrypted_path.nonce),
+                encrypted_path: Some(encrypted_path.ciphertext),
+                nonce: BASE64.encode(nonce_bytes),
+                ciphertext: BASE64.encode(ciphertext),
+            });
+
+            files_added += 1;
+            app.emit(
+                "vault-encryption-progress",
+                EncryptionProgress {
+                    current: files_added,
+                    total: total_files,
+                    file_name,
+                },
+            )
+            .map_err(|error| format!("Could not report encryption progress: {error}"))?;
+        }
+    }
+
+    fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&metadata)
+            .map_err(|error| format!("Could not serialize metadata: {error}"))?,
+    )
+    .map_err(|error| format!("Could not write metadata file: {error}"))?;
+
+    Ok(AddFilesToVaultResponse {
+        vault_path: vault_path.to_string_lossy().to_string(),
+        files_added,
+        total_files: metadata.files.len(),
+    })
+}
+
+#[tauri::command]
+fn unlock_vault_container(request: UnlockVaultRequest) -> Result<UnlockVaultResponse, String> {
+    if request.password.is_empty() {
+        return Err("Vault password is required.".to_string());
+    }
+
+    let vault_path = PathBuf::from(&request.vault_path);
+    if !vault_path.is_dir() {
+        return Err("Select an existing vault folder.".to_string());
+    }
+
+    let metadata_path = vault_path.join("vault.meta.json");
+    let metadata_bytes = fs::read(&metadata_path)
+        .map_err(|error| format!("Could not read vault metadata: {error}"))?;
+    let metadata: VaultMetadata = serde_json::from_slice(&metadata_bytes)
+        .map_err(|error| format!("Vault metadata is invalid: {error}"))?;
+
+    let key_bytes = derive_key(&request.password, metadata.salt.as_bytes())?;
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|error| format!("Invalid AES key: {error}"))?;
+
+    let destination = std::env::temp_dir()
+        .join(format!("securevault-unlock-{}", rand::thread_rng().r#gen::<u64>()));
+    fs::create_dir(&destination)
+        .map_err(|error| format!("Could not create temporary unlock folder: {error}"))?;
+
+    for entry in &metadata.files {
+        let relative_path = if metadata.version == 1 {
+            entry
+                .relative_path
+                .clone()
+                .ok_or_else(|| "Legacy vault is missing a file path.".to_string())?
+        } else {
+            let encrypted = EncryptedPath {
+                nonce: entry.path_nonce.clone().ok_or_else(|| {
+                    "Vault verification failed: encrypted path nonce is missing.".to_string()
+                })?,
+                ciphertext: entry.encrypted_path.clone().ok_or_else(|| {
+                    "Vault verification failed: encrypted path is missing.".to_string()
+                })?,
+            };
+            decrypt_relative_path(&cipher, &encrypted)?
+        };
+
+        let nonce_bytes = BASE64
+            .decode(&entry.nonce)
+            .map_err(|error| format!("Vault contains an invalid nonce: {error}"))?;
+        let nonce_array: [u8; 12] = nonce_bytes
+            .try_into()
+            .map_err(|_| "Vault contains a nonce with an invalid length.".to_string())?;
+        let ciphertext = BASE64
+            .decode(&entry.ciphertext)
+            .map_err(|error| format!("Vault contains invalid encrypted data: {error}"))?;
+        let plaintext = cipher
+            .decrypt(&Nonce::from(nonce_array), ciphertext.as_ref())
+            .map_err(|_| {
+                "Password is incorrect or vault integrity verification failed.".to_string()
+            })?;
+
+        let output_path = destination.join(&relative_path);
+        fs::write(&output_path, plaintext)
+            .map_err(|error| format!("Could not write file: {error}"))?;
+    }
+
+    make_directory_readonly(&destination)?;
+
+    Ok(UnlockVaultResponse {
+        unlock_path: destination.to_string_lossy().to_string(),
+        file_count: metadata.files.len(),
+    })
+}
+
 fn encrypt_folder_to_vault(
     app: &tauri::AppHandle,
     source_path: &Path,
@@ -348,7 +602,13 @@ fn encrypt_folder_to_vault(
 
     let staging_dir = parent_dir.join(format!(".securevault-staging-{}", rng.r#gen::<u64>()));
     fs::create_dir(&staging_dir)
-        .map_err(|error| format!("Could not create temporary vault folder: {error}"))?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                format!("Could not create vault: you don't have write permission to {}. Select a folder on a volume where you can write files.", parent_dir.display())
+            } else {
+                format!("Could not create temporary vault folder: {error}")
+            }
+        })?;
 
     let write_result = (|| {
         let metadata = VaultMetadata {
@@ -663,7 +923,13 @@ fn restore_encrypted_vault(
         rand::thread_rng().r#gen::<u64>()
     ));
     fs::create_dir(&staging_path)
-        .map_err(|error| format!("Could not create temporary restore folder: {error}"))?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                format!("Could not restore vault: you don't have write permission to {}. Select a destination folder where you can write files.", destination.display())
+            } else {
+                format!("Could not create temporary restore folder: {error}")
+            }
+        })?;
     let total_files = metadata.files.len();
     let total_entries = total_files + metadata.directories.len();
     let mut seen_paths = std::collections::HashSet::with_capacity(total_entries);
@@ -1078,7 +1344,10 @@ pub fn run() {
             get_drive_analysis,
             lock_unlocked_folder,
             unlock_folder_for_modification,
-            format_volume
+            format_volume,
+            create_vault,
+            add_files_to_vault,
+            unlock_vault_container
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
