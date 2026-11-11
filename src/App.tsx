@@ -36,6 +36,7 @@ type DriveAudit = {
   available: string
   filesystem: string
   removable: boolean
+  mountPoint: string
 }
 
 const navItems = [
@@ -69,6 +70,7 @@ function App() {
   const [restoreProgress, setRestoreProgress] = useState<EncryptionProgress | null>(null)
   const [unlockedSession, setUnlockedSession] = useState<UnlockedSession | null>(null)
   const [idleSeconds, setIdleSeconds] = useState(600)
+  const [isFolderWritable, setIsFolderWritable] = useState(false)
   const unlockedSessionRef = useRef<UnlockedSession | null>(null)
   const lockOperationRef = useRef<Promise<LockResult> | null>(null)
   const lockingSessionRef = useRef(false)
@@ -135,6 +137,34 @@ function App() {
     }
   }
 
+  const [formatTarget, setFormatTarget] = useState('')
+  const [formatFs, setFormatFs] = useState('ExFAT')
+  const [formatName, setFormatName] = useState('SECUREVAULT')
+  const [formatConfirm, setFormatConfirm] = useState('')
+  const [formatStatus, setFormatStatus] = useState('')
+  const [isFormatting, setIsFormatting] = useState(false)
+
+  const handleFormat = async () => {
+    setIsFormatting(true)
+    setFormatStatus('Formatting…')
+    try {
+      await invoke<string>('format_volume', {
+        mountPoint: formatTarget,
+        filesystem: formatFs,
+        newName: formatName,
+        confirmation: formatConfirm,
+      })
+      setFormatStatus('Volume formatted.')
+      setFormatConfirm('')
+      setFormatTarget('')
+      await refreshDriveInventory()
+    } catch (error) {
+      setFormatStatus(`Format failed: ${String(error)}`)
+    } finally {
+      setIsFormatting(false)
+    }
+  }
+
   const navigateTo = (tab: string) => {
     setActiveTab(tab)
     if (tab === 'Connected Drives' || tab === 'Smart Format') {
@@ -145,8 +175,33 @@ function App() {
   const updateUnlockedSession = (session: UnlockedSession | null) => {
     unlockedSessionRef.current = session
     setUnlockedSession(session)
-    if (!session) setIdleSeconds(600)
+    if (!session) {
+      setIdleSeconds(600)
+      setIsFolderWritable(false)
+    }
     lockFailedRef.current = false
+  }
+
+  const handleToggleFolderAccess = async () => {
+    if (!unlockedSession) return
+
+    try {
+      if (isFolderWritable) {
+        await invoke<void>('lock_unlocked_folder', {
+          folderPath: unlockedSession.folderPath,
+        })
+        setIsFolderWritable(false)
+        setStatusText('Folder is now read-only for protection.')
+      } else {
+        await invoke<void>('unlock_folder_for_modification', {
+          folderPath: unlockedSession.folderPath,
+        })
+        setIsFolderWritable(true)
+        setStatusText('Folder is now writable. Remember to lock it when done.')
+      }
+    } catch (error) {
+      setStatusText(`Could not change folder access: ${String(error)}`)
+    }
   }
 
   const lockOpenedFolder = (session: UnlockedSession): Promise<LockResult> => {
@@ -157,13 +212,15 @@ function App() {
     setIsCreating(true)
     setEncryptionProgress({ current: 0, total: 0, fileName: '' })
     setStatusText('Verifying and locking the unlocked folder…')
-    const operation = invoke<LockResult>('lock_folder', {
+    const operation = invoke<void>('lock_unlocked_folder', {
+      folderPath: session.folderPath,
+    }).then(() => invoke<LockResult>('lock_folder', {
       request: {
         sourcePath: session.folderPath,
         password: session.password,
         confirmRemoveOriginal: true,
       },
-    }).then((result) => {
+    })).then((result) => {
       updateUnlockedSession(null)
       setSelectedFolder('')
       setSelectedVault(result.vaultPath)
@@ -412,7 +469,7 @@ function App() {
         <div className="status-panel">
           <p className="panel-label">Vault protection</p>
           <div className="security-state">AES-256-GCM</div>
-          <p className="panel-copy">Locking encrypts, verifies, then removes the selected plaintext folder. Biometrics and physical drive operations are not enabled.</p>
+          <p className="panel-copy">Locking encrypts, verifies, then removes the selected plaintext folder. Biometrics are not enabled.</p>
         </div>
       </aside>
 
@@ -453,20 +510,30 @@ function App() {
               <span>{unlockedSession.folderPath}</span>
               <small>
                 Auto-lock in {Math.floor(idleSeconds / 60)}:{String(idleSeconds % 60).padStart(2, '0')}.
-                Other applications may retain access to files they already opened.
+                Folder is read-only for protection. {isFolderWritable && 'You temporarily enabled write access.'}
               </small>
               {statusText.startsWith('Folder lock failed:') && (
                 <small className="session-error" role="alert">{statusText}</small>
               )}
             </div>
-            <button
-              type="button"
-              className="primary-button"
-              onClick={() => { void lockOpenedFolder(unlockedSession).catch(() => undefined) }}
-              disabled={isCreating}
-            >
-              {isCreating ? 'Locking…' : 'Lock now'}
-            </button>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={handleToggleFolderAccess}
+                disabled={isCreating}
+              >
+                {isFolderWritable ? 'Make read-only' : 'Enable access'}
+              </button>
+              <button
+                type="button"
+                className="primary-button"
+                onClick={() => { void lockOpenedFolder(unlockedSession).catch(() => undefined) }}
+                disabled={isCreating}
+              >
+                {isCreating ? 'Locking…' : 'Lock now'}
+              </button>
+            </div>
           </div>
         )}
 
@@ -524,7 +591,7 @@ function App() {
                   <li><span>Biometric unlock</span><strong>Not implemented</strong></li>
                   <li><span>Recovery keys</span><strong>Not available</strong></li>
                   <li><span>Mounted volume inventory</span><strong>Available</strong></li>
-                  <li><span>Disk modification</span><strong>Disabled</strong></li>
+                  <li><span>Disk modification</span><strong>Removable volumes only</strong></li>
                 </ul>
               </article>
             </section>
@@ -632,7 +699,7 @@ function App() {
               {isLoadingDrives ? 'Scanning…' : 'Refresh inventory'}
             </button>
             <p className="section-description">
-              SecureVault inspects mounted volumes on this device. Physical partitioning, resizing, conversion, and formatting are intentionally disabled; this inventory does not inspect unmounted partitions or establish backup safety.
+              SecureVault inspects mounted volumes on this device. Partitioning, resizing and conversion are disabled; only removable volumes can be erased and formatted, after typed confirmation; this inventory does not inspect unmounted partitions or establish backup safety.
             </p>
             <div className="drive-grid">
               {drives.map((drive) => (
@@ -650,14 +717,42 @@ function App() {
                 </article>
               ))}
             </div>
+            <div className="support-grid">
+              <article>
+                <strong>Format removable volume</strong>
+                <select value={formatTarget} onChange={(e) => setFormatTarget(e.target.value)}>
+                  <option value="">Select a removable volume</option>
+                  {drives.filter((d) => d.removable).map((d) => (
+                    <option key={d.mountPoint} value={d.mountPoint}>{d.name} ({d.mountPoint})</option>
+                  ))}
+                </select>
+                <select value={formatFs} onChange={(e) => setFormatFs(e.target.value)}>
+                  <option value="ExFAT">ExFAT</option>
+                  <option value="APFS">APFS</option>
+                  <option value="JHFS+">Mac OS Extended</option>
+                  <option value="MS-DOS FAT32">FAT32</option>
+                </select>
+                <input value={formatName} maxLength={11} onChange={(e) => setFormatName(e.target.value)} aria-label="New volume name" />
+                <input
+                  value={formatConfirm}
+                  onChange={(e) => setFormatConfirm(e.target.value)}
+                  placeholder={formatTarget ? 'Type ERASE ' + formatTarget.split('/').pop() : 'Select a volume first'}
+                  aria-label="Erase confirmation"
+                />
+                <button type="button" className="primary-button" onClick={handleFormat} disabled={isFormatting || !formatTarget || !formatConfirm}>
+                  {isFormatting ? 'Formatting…' : 'Erase and format'}
+                </button>
+                <span role="status">{formatStatus}</span>
+              </article>
+            </div>
             <p className="status-text" role="status">
-              {isLoadingDrives ? 'Scanning mounted volumes…' : `${drives.length} mounted volume(s) found. No disk changes are performed.`}
+              {isLoadingDrives ? 'Scanning mounted volumes…' : `${drives.length} mounted volume(s) found.`}
             </p>
             <div className="support-grid">
               <article><strong>New volume</strong><span>Requires live partition and filesystem analysis.</span></article>
               <article><strong>New partition</strong><span>Requires privileged disk tools and explicit confirmation.</span></article>
               <article><strong>Resize or convert</strong><span>Filesystem-specific support and verified backups are required.</span></article>
-              <article><strong>Reformat</strong><span>Destructive; not offered in this build.</span></article>
+              <article><strong>Reformat</strong><span>Destructive; removable volumes only (macOS).</span></article>
             </div>
             <button type="button" className="primary-button" onClick={() => navigateTo('Folder Lock')}>
               Create a file-based encrypted vault instead

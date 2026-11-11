@@ -56,6 +56,7 @@ pub struct DriveAudit {
     pub available: String,
     pub filesystem: String,
     pub removable: bool,
+    pub mount_point: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -116,7 +117,21 @@ fn walk_source_tree(source_path: &Path) -> Result<FolderContents, String> {
     let mut files = Vec::new();
     let mut directories = Vec::new();
 
-    for entry in WalkDir::new(source_path) {
+    for entry in WalkDir::new(source_path)
+        .into_iter()
+        .filter_map(|e| {
+            match e {
+                Ok(entry) => Some(Ok(entry)),
+                Err(error) => {
+                    if error.io_error().map_or(false, |io| io.kind() == std::io::ErrorKind::PermissionDenied) {
+                        None
+                    } else {
+                        Some(Err(error))
+                    }
+                }
+            }
+        })
+    {
         let entry = entry.map_err(|error| format!("Could not inspect selected folder: {error}"))?;
         if entry.depth() == 0 {
             continue;
@@ -222,6 +237,7 @@ fn get_drive_analysis() -> Vec<DriveAudit> {
                 available: format_bytes(disk.available_space()),
                 filesystem: disk.file_system().to_string_lossy().to_string(),
                 removable: disk.is_removable(),
+                mount_point: mount_name,
             }
         })
         .collect()
@@ -780,6 +796,19 @@ fn restore_encrypted_vault(
             }
             return Err(message);
         }
+
+        if let Err(error) = make_directory_readonly(&restored_path) {
+            let cleanup_error = fs::remove_dir_all(&restored_path).err();
+            let mut message = format!(
+                "The folder was unlocked but could not be set to read-only for protection: {error}."
+            );
+            if let Some(cleanup_error) = cleanup_error {
+                message.push_str(&format!(
+                    " The unprotected folder could not be removed: {cleanup_error}."
+                ));
+            }
+            return Err(message);
+        }
     }
 
     Ok(RestoreVaultResponse {
@@ -924,6 +953,121 @@ mod tests {
     }
 }
 
+fn make_directory_readonly(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for entry in WalkDir::new(path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let entry_path = entry.path();
+        let permissions = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(entry_path, permissions)
+            .map_err(|error| format!("Could not make {} read-only: {}", entry_path.display(), error))?;
+    }
+
+    Ok(())
+}
+
+fn make_directory_writable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for entry in WalkDir::new(path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let entry_path = entry.path();
+        let permissions = if entry.file_type().is_dir() {
+            std::fs::Permissions::from_mode(0o755)
+        } else {
+            std::fs::Permissions::from_mode(0o644)
+        };
+        std::fs::set_permissions(entry_path, permissions)
+            .map_err(|error| format!("Could not make {} writable: {}", entry_path.display(), error))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn lock_unlocked_folder(folder_path: String) -> Result<String, String> {
+    let path = PathBuf::from(&folder_path);
+    if !path.exists() || !path.is_dir() {
+        return Err("Folder does not exist or is not accessible.".to_string());
+    }
+
+    make_directory_readonly(&path)?;
+    Ok(format!("Folder locked and made read-only: {}", folder_path))
+}
+
+#[tauri::command]
+fn unlock_folder_for_modification(folder_path: String) -> Result<String, String> {
+    let path = PathBuf::from(&folder_path);
+    if !path.exists() || !path.is_dir() {
+        return Err("Folder does not exist or is not accessible.".to_string());
+    }
+
+    make_directory_writable(&path)?;
+    Ok(format!("Folder unlocked for modification: {}", folder_path))
+}
+
+#[tauri::command]
+fn format_volume(
+    mount_point: String,
+    filesystem: String,
+    new_name: String,
+    confirmation: String,
+) -> Result<String, String> {
+    if !cfg!(target_os = "macos") {
+        return Err("Formatting is only supported on macOS in this build.".to_string());
+    }
+    let fs_arg = match filesystem.as_str() {
+        "APFS" | "JHFS+" | "ExFAT" | "MS-DOS FAT32" => filesystem.as_str(),
+        _ => return Err("Unsupported target filesystem.".to_string()),
+    };
+    let label = new_name.trim();
+    if label.is_empty()
+        || label.len() > 11
+        || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '_' || c == '-')
+    {
+        return Err("Name must be 1-11 letters, numbers, spaces, '-' or '_'.".to_string());
+    }
+
+    let canonical = Path::new(&mount_point)
+        .canonicalize()
+        .map_err(|error| format!("Volume is not accessible: {error}"))?;
+    if canonical.parent() != Some(Path::new("/Volumes")) {
+        return Err("Only external volumes mounted under /Volumes can be formatted.".to_string());
+    }
+    let disks = Disks::new_with_refreshed_list();
+    let disk = disks
+        .list()
+        .iter()
+        .find(|disk| disk.mount_point() == canonical.as_path())
+        .ok_or("Volume was not found in the mounted volume list.")?;
+    if !disk.is_removable() {
+        return Err("Only removable volumes can be formatted.".to_string());
+    }
+    let expected = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if confirmation != format!("ERASE {expected}") {
+        return Err(format!("Confirmation text must be exactly: ERASE {expected}"));
+    }
+
+    let output = std::process::Command::new("/usr/sbin/diskutil")
+        .args(["eraseVolume", fs_arg, label])
+        .arg(&canonical)
+        .output()
+        .map_err(|error| format!("Could not run diskutil: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -931,7 +1075,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             lock_folder,
             restore_encrypted_vault,
-            get_drive_analysis
+            get_drive_analysis,
+            lock_unlocked_folder,
+            unlock_folder_for_modification,
+            format_volume
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
